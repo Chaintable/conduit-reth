@@ -56,6 +56,13 @@ pub trait ReceiptConverter<N: NodePrimitives>: Debug + 'static {
     ) -> Result<Vec<Self::RpcReceipt>, Self::Error> {
         self.convert_receipts(receipts)
     }
+
+
+    /// Gets the deposit nonce from a receipt if available.
+    fn get_deposit_nonce(&self, receipt_response: &Self::RpcReceipt) -> Option<u64>;
+
+    /// Gets the l1 fee from a receipt if available.
+    fn get_l1_fee(&self, receipt_response: &Self::RpcReceipt) -> Option<u128>;
 }
 
 /// A type that knows how to convert a consensus header into an RPC header.
@@ -182,6 +189,17 @@ pub trait RpcConvert: Send + Sync + Unpin + Debug + DynClone + 'static {
         header: SealedHeaderFor<Self::Primitives>,
         block_size: usize,
     ) -> Result<RpcHeader<Self::Network>, Self::Error>;
+
+    /// Gets the deposit nonce from an RPC receipt if available.
+    /// Returns `None` for non-deposit transactions or chains that don't support deposits.
+    fn get_deposit_nonce(&self, _receipt: &RpcReceipt<Self::Network>) -> Option<u64> {
+        None
+    }
+    /// Gets the l1 fee from a receipt if available.
+    /// Returns `None` for non-op transactions or chains that don't support l1 fee.
+    fn get_l1_fee(&self, _receipt: &RpcReceipt<Self::Network>) -> Option<u128> {
+        None
+    }
 }
 
 dyn_clone::clone_trait_object!(
@@ -864,6 +882,15 @@ where
     ) -> Result<RpcHeader<Self::Network>, Self::Error> {
         Ok(self.header_converter.convert_header(header, block_size)?)
     }
+
+    fn get_deposit_nonce(&self, receipt: &RpcReceipt<Self::Network>) -> Option<u64> {
+        self.receipt_converter.get_deposit_nonce(receipt)
+    }
+
+    fn get_l1_fee(&self, receipt: &RpcReceipt<Self::Network>) -> Option<u128> {
+        self.receipt_converter.get_l1_fee(receipt)
+    }
+
 }
 
 /// Optimism specific RPC transaction compatibility implementations.
