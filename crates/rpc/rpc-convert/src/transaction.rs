@@ -57,12 +57,19 @@ pub trait ReceiptConverter<N: NodePrimitives>: Debug + 'static {
         self.convert_receipts(receipts)
     }
 
-
     /// Gets the deposit nonce from a receipt if available.
-    fn get_deposit_nonce(&self, receipt_response: &Self::RpcReceipt) -> Option<u64>;
+    ///
+    /// Defaults to `None`; OP receipt converters override.
+    fn get_deposit_nonce(&self, _receipt_response: &Self::RpcReceipt) -> Option<u64> {
+        None
+    }
 
     /// Gets the l1 fee from a receipt if available.
-    fn get_l1_fee(&self, receipt_response: &Self::RpcReceipt) -> Option<u128>;
+    ///
+    /// Defaults to `None`; OP receipt converters override.
+    fn get_l1_fee(&self, _receipt_response: &Self::RpcReceipt) -> Option<u128> {
+        None
+    }
 }
 
 /// A type that knows how to convert a consensus header into an RPC header.
@@ -890,7 +897,6 @@ where
     fn get_l1_fee(&self, receipt: &RpcReceipt<Self::Network>) -> Option<u128> {
         self.receipt_converter.get_l1_fee(receipt)
     }
-
 }
 
 /// Optimism specific RPC transaction compatibility implementations.
