@@ -2,6 +2,7 @@ use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockId;
 use alloy_evm::block::calc::{base_block_reward_pre_merge, block_reward, ommer_reward};
 use alloy_primitives::{
+    b256,
     map::{HashMap, HashSet},
     Address, BlockHash, Bytes, B256, U256,
 };
@@ -44,11 +45,7 @@ use revm_inspectors::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io::{BufRead, BufReader},
-    sync::Arc,
-};
+use std::sync::Arc;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 /// Ronin mainnet chain id. Used to gate the L1->L2 migration synthetic-genesis branch.
@@ -56,59 +53,9 @@ const RONIN_CHAIN_ID: u64 = 2020;
 /// Block at which Ronin's state is bootstrapped from an official `state.jsonl` dump via
 /// `op-reth init-state --without-evm`. At this height there are no real transactions.
 const RONIN_STATE_EXPORT_BLOCK: u64 = 55577500;
-/// Env var pointing to the `state.jsonl` file produced by the Ronin migration tooling.
-const RONIN_STATE_EXPORT_ENV: &str = "RETH_STATE_EXPORT_FILE";
 
-/// First line of `state.jsonl`: `{"root":"<hash>"}`. Mirrors the private struct in
-/// `reth-db-common::init` so we can reuse the canonical on-disk format.
-#[derive(Debug, Deserialize)]
-struct StateRootLine {
-    #[allow(dead_code)]
-    root: alloy_primitives::B256,
-}
-
-/// Subsequent lines of `state.jsonl`: a [`alloy_genesis::GenesisAccount`] flattened together
-/// with its address. Schema must stay byte-compatible with `reth-db-common::init`'s parser.
-#[derive(Debug, Deserialize)]
-struct GenesisAccountWithAddress {
-    #[serde(flatten)]
-    genesis_account: alloy_genesis::GenesisAccount,
-    address: Address,
-}
-
-/// Parses an `op-reth` state dump file into a synthetic [`alloy_genesis::Genesis`].
-///
-/// Only the `alloc` map is populated - other genesis fields are irrelevant for downstream
-/// `BlockStorageDiff::from(&Genesis)` and `get_storage_contracts_from_genesis` consumers.
-fn parse_state_jsonl_as_genesis(path: &str) -> Result<alloy_genesis::Genesis, std::io::Error> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    let mut first = String::new();
-    reader.read_line(&mut first)?;
-    // Validate the leading state-root line so a malformed file fails fast instead of
-    // silently producing an empty alloc map.
-    let _: StateRootLine = serde_json::from_str(first.trim())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let mut alloc = std::collections::BTreeMap::new();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: GenesisAccountWithAddress = serde_json::from_str(line.trim())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        alloc.insert(entry.address, entry.genesis_account);
-    }
-
-    Ok(alloy_genesis::Genesis { alloc, ..Default::default() })
-}
+const RONIN_GENESIS_PARENT_STATE: B256 =
+    b256!("0xa8fe53c7551bc10fae45cd0273e2008b26585eaf16dce34aff7291d36bb1c8d4");
 
 /// `trace` API implementation.
 ///
@@ -752,23 +699,19 @@ where
         // The state.jsonl path is provided via the `RETH_STATE_EXPORT_FILE` env var because
         // plumbing datadir through TraceApi would require adding a trait bound across the node
         // builder. Operators set this env var in the docker entrypoint.
-        if self.provider().chain_spec().chain().id() == RONIN_CHAIN_ID
-            && block.number() == RONIN_STATE_EXPORT_BLOCK
+        if self.provider().chain_spec().chain().id() == RONIN_CHAIN_ID &&
+            block.number() == RONIN_STATE_EXPORT_BLOCK
         {
-            let path = std::env::var(RONIN_STATE_EXPORT_ENV)
-                .unwrap_or_else(|_| "state.jsonl".to_string());
-            let genesis = parse_state_jsonl_as_genesis(&path)
-                .map_err(|e| EthApiError::Internal(reth_errors::RethError::other(e)))?;
-            let mut state_diff: BlockStorageDiff = (&genesis).into();
-            state_diff.hash = block.state_root();
-            // parent_hash is intentionally left as the default (EMPTY_ROOT_HASH from
-            // `From<&Genesis>`) - this block is treated as a synthetic genesis, with no
-            // meaningful pre-state to diff against.
+            let state_diff: BlockStorageDiff = BlockStorageDiff {
+                hash: block.state_root(),
+                parent_hash: RONIN_GENESIS_PARENT_STATE,
+                ..Default::default()
+            };
             let block_file = BlockFile {
                 block: debank_block,
                 transactions: Vec::new(),
                 traces: Vec::new(),
-                storage_contracts: get_storage_contracts_from_genesis(&genesis),
+                storage_contracts: Vec::new(),
                 ..Default::default()
             };
             let validation_hash = block_file.validation().validation_hash;
