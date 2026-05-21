@@ -52,7 +52,7 @@ use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 const RONIN_CHAIN_ID: u64 = 2020;
 /// Block at which Ronin's state is bootstrapped from an official `state.jsonl` dump via
 /// `op-reth init-state --without-evm`. At this height there are no real transactions.
-const RONIN_STATE_EXPORT_BLOCK: u64 = 55577500;
+const RONIN_GENESIS_BLOCK: u64 = 55577500;
 
 const RONIN_GENESIS_PARENT_STATE: B256 =
     b256!("0xa8fe53c7551bc10fae45cd0273e2008b26585eaf16dce34aff7291d36bb1c8d4");
@@ -703,7 +703,7 @@ where
         // plumbing datadir through TraceApi would require adding a trait bound across the node
         // builder. Operators set this env var in the docker entrypoint.
         if self.provider().chain_spec().chain().id() == RONIN_CHAIN_ID &&
-            block.number() == RONIN_STATE_EXPORT_BLOCK
+            block.number() == RONIN_GENESIS_BLOCK
         {
             let chain_spec = self.provider().chain_spec();
             let genesis = chain_spec.genesis();
