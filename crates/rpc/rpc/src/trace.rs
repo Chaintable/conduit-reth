@@ -705,11 +705,11 @@ where
         if self.provider().chain_spec().chain().id() == RONIN_CHAIN_ID &&
             block.number() == RONIN_STATE_EXPORT_BLOCK
         {
-            let state_diff: BlockStorageDiff = BlockStorageDiff {
-                hash: block.state_root(),
-                parent_hash: RONIN_GENESIS_PARENT_STATE,
-                ..Default::default()
-            };
+            let chain_spec = self.provider().chain_spec();
+            let genesis = chain_spec.genesis();
+            let mut state_diff: BlockStorageDiff = genesis.into();
+            state_diff.hash = block.state_root();
+            state_diff.parent_hash=RONIN_GENESIS_PARENT_STATE;
             debank_block.parent_id = RONIN_GENESIS_PARENT_HASH;
             debank_header.parent_hash = RONIN_GENESIS_PARENT_HASH;
             let block_file = BlockFile {
