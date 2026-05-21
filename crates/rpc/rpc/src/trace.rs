@@ -57,6 +57,9 @@ const RONIN_STATE_EXPORT_BLOCK: u64 = 55577500;
 const RONIN_GENESIS_PARENT_STATE: B256 =
     b256!("0xa8fe53c7551bc10fae45cd0273e2008b26585eaf16dce34aff7291d36bb1c8d4");
 
+const RONIN_GENESIS_PARENT_HASH: B256 =
+    b256!("0x5e55f27976de00b9c7ebaeff8209864cd8b5142ccbb72f7227c452844f6b3764");
+
 /// `trace` API implementation.
 ///
 /// This type provides the functionality for handling `trace` related requests.
@@ -637,8 +640,8 @@ where
     pub async fn trace_debank_block(&self, block_id: BlockId) -> Result<DebankOutPut, Eth::Error> {
         let block = self.eth_api().recovered_block(block_id).await?;
         let Some(block) = block else { return Err(EthApiError::HeaderNotFound(block_id).into()) };
-        let debank_block: DebankBlock = block.as_ref().into();
-        let debank_header = Header {
+        let mut debank_block: DebankBlock = block.as_ref().into();
+        let mut debank_header = Header {
             inner: alloy_consensus::Header {
                 parent_hash: block.header().parent_hash(),
                 ommers_hash: block.header().ommers_hash(),
@@ -707,6 +710,8 @@ where
                 parent_hash: RONIN_GENESIS_PARENT_STATE,
                 ..Default::default()
             };
+            debank_block.parent_id = RONIN_GENESIS_PARENT_HASH;
+            debank_header.parent_hash = RONIN_GENESIS_PARENT_HASH;
             let block_file = BlockFile {
                 block: debank_block,
                 transactions: Vec::new(),
