@@ -2,12 +2,13 @@ use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockId;
 use alloy_evm::block::calc::{base_block_reward_pre_merge, block_reward, ommer_reward};
 use alloy_primitives::{
+    b256,
     map::{HashMap, HashSet},
     Address, BlockHash, Bytes, B256, U256,
 };
 use alloy_rpc_types_eth::{
     state::{EvmOverrides, StateOverride},
-    BlockOverrides, Index,
+    BlockOverrides, Header, Index,
 };
 use alloy_rpc_types_trace::{
     filter::TraceFilter,
@@ -17,16 +18,21 @@ use alloy_rpc_types_trace::{
 };
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
-use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{BlockBody, BlockHeader};
+use reth_revm::bytecode::OpCode;
 use reth_rpc_api::TraceApiServer;
-use reth_rpc_convert::RpcTxReq;
+use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_api::{
-    helpers::{Call, LoadPendingBlock, LoadTransaction, Trace, TraceExt},
+    helpers::{Call, EthBlocks, LoadPendingBlock, LoadReceipt, LoadTransaction, Trace, TraceExt},
     FromEthApiError, RpcNodeCore,
 };
-use reth_rpc_eth_types::{error::EthApiError, utils::recover_raw_transaction, EthConfig};
+use reth_rpc_eth_types::{
+    build_debank_traces, build_genesis_txs_and_traces, error::EthApiError,
+    get_storage_contracts_from_genesis, utils::recover_raw_transaction, BlockFile,
+    BlockStorageDiff, DebankBlock, DebankOutPut, DebankTransaction, EthConfig,
+};
 use reth_storage_api::{BlockNumReader, BlockReader};
 use reth_tasks::pool::BlockingTaskGuard;
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
@@ -34,11 +40,25 @@ use revm::DatabaseCommit;
 use revm_inspectors::{
     opcode::OpcodeGasInspector,
     storage::StorageInspector,
-    tracing::{parity::populate_state_diff, TracingInspector, TracingInspectorConfig},
+    tracing::{
+        parity::populate_state_diff, OpcodeFilter, TracingInspector, TracingInspectorConfig,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
+
+/// Ronin mainnet chain id. Used to gate the L1->L2 migration synthetic-genesis branch.
+const RONIN_CHAIN_ID: u64 = 2020;
+/// Block at which Ronin's state is bootstrapped from an official `state.jsonl` dump via
+/// `op-reth init-state --without-evm`. At this height there are no real transactions.
+const RONIN_GENESIS_BLOCK: u64 = 55577500;
+
+const RONIN_GENESIS_PARENT_STATE: B256 =
+    b256!("0xa8fe53c7551bc10fae45cd0273e2008b26585eaf16dce34aff7291d36bb1c8d4");
+
+const RONIN_GENESIS_PARENT_HASH: B256 =
+    b256!("0x5e55f27976de00b9c7ebaeff8209864cd8b5142ccbb72f7227c452844f6b3764");
 
 /// `trace` API implementation.
 ///
@@ -612,10 +632,183 @@ where
     }
 }
 
+impl<Eth> TraceApi<Eth>
+where
+    Eth: TraceExt + 'static + EthBlocks + LoadReceipt,
+{
+    /// Returns debank's trace information for a given block.
+    pub async fn trace_debank_block(&self, block_id: BlockId) -> Result<DebankOutPut, Eth::Error> {
+        let block = self.eth_api().recovered_block(block_id).await?;
+        let Some(block) = block else { return Err(EthApiError::HeaderNotFound(block_id).into()) };
+        let mut debank_block: DebankBlock = block.as_ref().into();
+        let mut debank_header = Header {
+            inner: alloy_consensus::Header {
+                parent_hash: block.header().parent_hash(),
+                ommers_hash: block.header().ommers_hash(),
+                beneficiary: block.header().beneficiary(),
+                state_root: block.header().state_root(),
+                transactions_root: block.header().transactions_root(),
+                receipts_root: block.header().receipts_root(),
+                logs_bloom: block.header().logs_bloom(),
+                difficulty: block.header().difficulty(),
+                number: block.header().number(),
+                gas_limit: block.header().gas_limit(),
+                gas_used: block.header().gas_used(),
+                timestamp: block.header().timestamp(),
+                extra_data: block.header().extra_data().clone(),
+                mix_hash: block.header().mix_hash().unwrap_or_default(),
+                nonce: block.header().nonce().unwrap_or_default(),
+                base_fee_per_gas: block.header().base_fee_per_gas(),
+                withdrawals_root: block.header().withdrawals_root(),
+                blob_gas_used: block.header().blob_gas_used(),
+                excess_blob_gas: block.header().excess_blob_gas(),
+                parent_beacon_block_root: block.header().parent_beacon_block_root(),
+                requests_hash: block.header().requests_hash(),
+            },
+            hash: block.hash(),
+            total_difficulty: None,
+            size: None,
+        };
+        if block.number() == 0 {
+            let chain_spec = self.provider().chain_spec();
+            let genesis = chain_spec.genesis();
+            let mut state_diff: BlockStorageDiff = genesis.into();
+            state_diff.hash = block.state_root();
+            let (transactions, traces) = build_genesis_txs_and_traces(genesis);
+            let block_file = BlockFile {
+                block: debank_block,
+                transactions,
+                traces,
+                storage_contracts: get_storage_contracts_from_genesis(genesis),
+                ..Default::default()
+            };
+            let validation_hash = block_file.validation().validation_hash;
+            return Ok(DebankOutPut {
+                block_file,
+                header: debank_header,
+                state_diff: alloy_rlp::encode(state_diff).into(),
+                validation_hash,
+            });
+        }
+
+        // Ronin L1->L2 migration synthetic-genesis branch.
+        //
+        // At block 55577500 the Ronin chain is bootstrapped via `op-reth init-state` from an
+        // official `state.jsonl` dump. There are no real transactions or traces at this height -
+        // the block exists purely to install the post-migration state. The debank indexer still
+        // needs the full state diff in the same shape genesis emits, but WITHOUT fake transactions
+        // or traces (per spec: state_diff + storage_contracts only).
+        //
+        // The state.jsonl path is provided via the `RETH_STATE_EXPORT_FILE` env var because
+        // plumbing datadir through TraceApi would require adding a trait bound across the node
+        // builder. Operators set this env var in the docker entrypoint.
+        if self.provider().chain_spec().chain().id() == RONIN_CHAIN_ID &&
+            block.number() == RONIN_GENESIS_BLOCK
+        {
+            let chain_spec = self.provider().chain_spec();
+            let genesis = chain_spec.genesis();
+            let mut state_diff: BlockStorageDiff = genesis.into();
+            state_diff.hash = block.state_root();
+            state_diff.parent_hash=RONIN_GENESIS_PARENT_STATE;
+            debank_block.parent_id = RONIN_GENESIS_PARENT_HASH;
+            debank_header.parent_hash = RONIN_GENESIS_PARENT_HASH;
+            let block_file = BlockFile {
+                block: debank_block,
+                transactions: Vec::new(),
+                traces: Vec::new(),
+                storage_contracts: Vec::new(),
+                ..Default::default()
+            };
+            let validation_hash = block_file.validation().validation_hash;
+            return Ok(DebankOutPut {
+                block_file,
+                header: debank_header,
+                state_diff: alloy_rlp::encode(state_diff).into(),
+                validation_hash,
+            });
+        }
+
+        let receipts = self.eth_api().block_receipts(block_id).await?;
+        let mut debank_txs: Vec<DebankTransaction> =
+            Vec::with_capacity(block.body().transactions().len());
+        let Some(receipts) = receipts else {
+            return Err(EthApiError::HeaderNotFound(block_id).into());
+        };
+        for index in 0..block.body().transactions().len() {
+            let tx = &block.body().transactions()[index];
+            let receipt = &receipts[index];
+            let deposit_nonce: Option<u64> = self.eth_api().converter().get_deposit_nonce(receipt);
+            let l1_fee: Option<u128> = self.eth_api().converter().get_l1_fee(receipt);
+            let debank_tx: DebankTransaction = (receipt, tx, deposit_nonce, l1_fee).into();
+            debank_txs.push(debank_tx);
+        }
+
+        let parent_block = self.eth_api().recovered_block(block.parent_hash().into()).await?;
+        let Some(parent_block) = parent_block else {
+            return Err(EthApiError::HeaderNotFound(block_id).into());
+        };
+        let mut block_file =
+            BlockFile { block: debank_block, transactions: debank_txs, ..Default::default() };
+        if parent_block.state_root() == block.state_root() {
+            let state_diff = BlockStorageDiff {
+                hash: block.state_root(),
+                parent_hash: parent_block.state_root(),
+                ..Default::default()
+            };
+            let validation_hash = block_file.validation().validation_hash;
+            return Ok(DebankOutPut {
+                block_file,
+                header: debank_header,
+                state_diff: alloy_rlp::encode(state_diff).into(),
+                validation_hash,
+            });
+        }
+        let log_index = std::cell::RefCell::new(0);
+        let (mut traces, mut state_diff, change_addresses) = self
+            .eth_api()
+            .trace_all_block(
+                block_id,
+                || {
+                    let mut trace_cfg = TracingInspectorConfig::default_parity()
+                        .set_steps(true)
+                        .set_record_logs(true)
+                        .set_exclude_precompile_calls(false);
+                    trace_cfg.record_opcodes_filter =
+                        Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+                    TracingInspector::new(trace_cfg)
+                },
+                move |tx_info, mut ctx| {
+                    Ok(build_debank_traces(
+                        tx_info.hash.unwrap(),
+                        ctx.take_inspector().into_traces(),
+                        &log_index,
+                    ))
+                },
+            )
+            .await?;
+        for (trace, error_trace, event, error_event) in traces.drain(..) {
+            block_file.traces.extend(trace);
+            block_file.error_traces.extend(error_trace);
+            block_file.events.extend(event);
+            block_file.error_events.extend(error_event);
+        }
+        state_diff.hash = block.state_root();
+        state_diff.parent_hash = parent_block.state_root();
+        block_file.storage_contracts = change_addresses;
+        let validation_hash = block_file.validation().validation_hash;
+        Ok(DebankOutPut {
+            block_file,
+            header: debank_header,
+            state_diff: alloy_rlp::encode(state_diff).into(),
+            validation_hash,
+        })
+    }
+}
+
 #[async_trait]
 impl<Eth> TraceApiServer<RpcTxReq<Eth::NetworkTypes>> for TraceApi<Eth>
 where
-    Eth: TraceExt + 'static,
+    Eth: TraceExt + EthBlocks + LoadReceipt + 'static,
 {
     /// Executes the given call and returns a number of possible traces for it.
     ///
@@ -734,6 +927,11 @@ where
     async fn trace_block_opcode_gas(&self, block_id: BlockId) -> RpcResult<Option<BlockOpcodeGas>> {
         let _permit = self.acquire_trace_permit().await;
         Ok(Self::trace_block_opcode_gas(self, block_id).await.map_err(Into::into)?)
+    }
+
+    async fn trace_debank_block(&self, block_id: BlockId) -> RpcResult<DebankOutPut> {
+        let _permit = self.acquire_trace_permit().await;
+        Ok(Self::trace_debank_block(self, block_id).await.map_err(Into::into)?)
     }
 }
 
